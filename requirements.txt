@@ -3,3 +3,4 @@ streamlit-drawable-canvas==0.9.0
 numpy>=1.24.0
 opencv-python-headless>=4.8.0.74
 ultralytics>=8.0.20
+altair==4.0.0
