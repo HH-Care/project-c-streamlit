@@ -194,7 +194,7 @@ def main():
     global frame, selection_method, selecting, selection_complete, start_point, end_point, selected_object_id
 
     # Load the YOLOv8 model
-    model = YOLO("models/exp1.pt")
+    model = YOLO("models/best.pt")
 
     # Open the video file
     video_path = "videos/deone.mp4"

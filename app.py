@@ -7,6 +7,33 @@ import tempfile
 import os
 from collections import defaultdict
 import time
+import warnings
+import logging
+from PIL import Image
+import base64
+from io import BytesIO
+
+# For the drawable canvas - now uncommented since it's installed
+try:
+    from streamlit_drawable_canvas import st_canvas
+    CANVAS_AVAILABLE = True
+except Exception as e:
+    CANVAS_AVAILABLE = False
+    st.warning(f"Canvas component not available: {str(e)}. Will use manual selection instead.")
+
+# Suppress Streamlit file watcher errors
+logging.getLogger('streamlit.watcher.local_sources_watcher').setLevel(logging.ERROR)
+
+# Setup a custom filter for PyTorch/YOLO warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torch')
+warnings.filterwarnings('ignore', category=UserWarning, module='ultralytics')
+warnings.filterwarnings('ignore', category=RuntimeWarning, module='torch')
+
+# Use try-except to handle startup errors with PyTorch/Streamlit interaction
+try:
+    import torch._classes
+except (ImportError, RuntimeError):
+    pass
 
 # Set page config
 st.set_page_config(
@@ -37,9 +64,17 @@ def init_session_state():
     if 'pixels_per_meter' not in st.session_state:
         st.session_state.pixels_per_meter = 100
     if 'processing_phase' not in st.session_state:
-        st.session_state.processing_phase = "upload"  # Phases: upload, detect, select, track
+        st.session_state.processing_phase = "upload"  # Phases: upload, draw, track
     if 'frame_count' not in st.session_state:
         st.session_state.frame_count = 0
+    if 'fps_value' not in st.session_state:
+        st.session_state.fps_value = 0.0
+    if 'latency_value' not in st.session_state:
+        st.session_state.latency_value = 0.0
+    if 'user_roi' not in st.session_state:
+        st.session_state.user_roi = None  # Store user-drawn bounding box
+    if 'first_frame' not in st.session_state:
+        st.session_state.first_frame = None  # Store first frame for drawing
 
 # Direction prediction function
 def predict_direction(points, box_sizes, num_points=5):
@@ -179,7 +214,7 @@ def select_object_from_detections(frame, detection_results):
 
 # Draw tracking visualization on frame
 def draw_tracking_visualization(frame, track_id, track, box_sizes, direction_data, speed_data, 
-                              frame_count, calibration_factor):
+                              frame_count, calibration_factor, fps=None, latency=None):
     """Draw tracking visualization elements on the frame"""
     annotated_frame = frame.copy()
     
@@ -238,7 +273,7 @@ def draw_tracking_visualization(frame, track_id, track, box_sizes, direction_dat
                                 (255, 0, 255), 2, tipLength=0.3)
     
     # Create a dark overlay at the TOP left for text display
-    info_panel_height = 150  # Adjust based on how much info you're displaying
+    info_panel_height = 170  # Adjusted to make room for FPS/latency
     info_panel_width = 300  # Adjust width as needed
     overlay = annotated_frame.copy()
     cv2.rectangle(overlay, (10, 10),
@@ -283,7 +318,56 @@ def draw_tracking_visualization(frame, track_id, track, box_sizes, direction_dat
     cv2.putText(annotated_frame, f"Cal Factor: {calibration_factor:.2f}", (20, 150),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
     
+    # Display FPS and latency information
+    if fps is not None:
+        cv2.putText(annotated_frame, f"FPS: {fps:.1f}", (20, 170),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+    
+    if latency is not None:
+        cv2.putText(annotated_frame, f"Latency: {latency:.2f} ms", (150, 170),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+    
     return annotated_frame
+
+# Helper function to convert PIL Image to base64 encoded image
+def image_to_base64(img):
+    buffered = BytesIO()
+    img.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    return f"data:image/png;base64,{img_str}"
+
+# Add new resize function
+def resize_frame_to_fit(frame, max_width=1200, max_height=800):
+    """Resize frame to fit within specified dimensions while maintaining aspect ratio."""
+    height, width = frame.shape[:2]
+    
+    # If frame is already smaller than max dimensions, return as is
+    if width <= max_width and height <= max_height:
+        return frame
+    
+    # Calculate aspect ratio
+    aspect_ratio = width / height
+    
+    # Determine new dimensions based on aspect ratio
+    if width > max_width or height > max_height:
+        if aspect_ratio > 1:  # Width is greater than height
+            new_width = max_width
+            new_height = int(new_width / aspect_ratio)
+            if new_height > max_height:  # If height still exceeds max_height
+                new_height = max_height
+                new_width = int(new_height * aspect_ratio)
+        else:  # Height is greater than width
+            new_height = max_height
+            new_width = int(new_height * aspect_ratio)
+            if new_width > max_width:  # If width still exceeds max_width
+                new_width = max_width
+                new_height = int(new_width / aspect_ratio)
+    else:
+        return frame  # No resizing needed
+    
+    # Resize the frame
+    resized_frame = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    return resized_frame
 
 def app():
     # Initialize session state
@@ -291,6 +375,9 @@ def app():
     
     # Main title
     st.title("🚁 Object Tracker")
+    
+    # Create two columns for the main layout
+    main_col1, main_col2 = st.columns([2, 1])
     
     # Sidebar configuration
     with st.sidebar:
@@ -327,14 +414,24 @@ def app():
             
             # Detection/tracking settings
             if st.session_state.processing_phase == "upload":
-                if st.button("Start Object Detection"):
-                    st.session_state.processing_phase = "detect"
-                    st.rerun()()
+                if st.button("Start Drawing Selection"):
+                    st.session_state.processing_phase = "draw"
+                    st.experimental_rerun()
             
-            elif st.session_state.processing_phase == "detect" or st.session_state.processing_phase == "select":
+            elif st.session_state.processing_phase == "draw":
+                st.info("Draw a bounding box around the object to track")
+                if st.button("Start Tracking"):
+                    if st.session_state.user_roi is not None:
+                        st.session_state.processing_phase = "track"
+                        st.experimental_rerun()
+                    else:
+                        st.error("Please draw a bounding box first")
+                
                 if st.button("Reset Video"):
                     st.session_state.processing_phase = "upload"
-                    st.rerun()()
+                    st.session_state.user_roi = None
+                    st.session_state.first_frame = None
+                    st.experimental_rerun()
             
             elif st.session_state.processing_phase == "track":
                 # Calibration settings
@@ -370,83 +467,194 @@ def app():
                     st.session_state.speed_history = {}
                     st.session_state.selected_object_id = None
                     st.session_state.frame_count = 0
-                    st.rerun()()
+                    st.session_state.fps_value = 0.0
+                    st.session_state.latency_value = 0.0
+                    st.session_state.user_roi = None
+                    st.session_state.first_frame = None
+                    st.experimental_rerun()
     
     # Main content area
-    main_container = st.container()
-    
-    with main_container:
+    with main_col1:
         # Display area for video/processing
         if st.session_state.processing_phase == "upload":
             st.info("Please select a video source and start processing")
             
             # Display a sample image or logo
             st.image("https://images.unsplash.com/photo-1473968512647-3e447244af8f?ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxzZWFyY2h8Mnx8ZHJvbmV8ZW58MHx8MHx8fDA%3D&auto=format&fit=crop&w=500&q=60", 
-                    caption="Object Tracker")
+                    caption="Object Tracker",
+                    use_column_width=True)
             
-        elif st.session_state.processing_phase == "detect":
-            st.info("Analyzing video for objects to track...")
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            # Load the model
-            model = YOLO("models/exp1.pt")
-            
-            # Open video file
-            cap = cv2.VideoCapture(st.session_state.video_path)
-            if not cap.isOpened():
-                st.error(f"Error: Could not open video file")
-                return
-            
-            # Read first frame
-            success, frame = cap.read()
-            if not success:
-                st.error("Failed to read video")
-                cap.release()
-                return
+        elif st.session_state.processing_phase == "draw":
+            # Load the first frame if not already loaded
+            if st.session_state.first_frame is None:
+                # Open video file
+                cap = cv2.VideoCapture(st.session_state.video_path)
+                if not cap.isOpened():
+                    st.error(f"Error: Could not open video file")
+                    return
                 
-            # Process with YOLO for initial detection
-            results = model.track(frame, persist=True)
-            
-            # Generate annotated frame with all detections
-            annotated_frame, object_ids = select_object_from_detections(frame, results)
-            
-            # Display frame with all detections
-            video_placeholder = st.empty()
-            video_placeholder.image(cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB), 
-                                   caption="Detected Objects")
-            
-            status_text.text("Detection complete. Please select an object to track.")
-            progress_bar.progress(100)
-            
-            # Selection interface
-            st.subheader("Select Object to Track")
-            
-            if object_ids:
-                selected_id = st.selectbox("Select object ID to track:", object_ids)
-                
-                if st.button("Start Tracking"):
-                    st.session_state.selected_object_id = int(selected_id)
-                    st.session_state.processing_phase = "track"
+                # Read first frame
+                success, frame = cap.read()
+                if not success:
+                    st.error("Failed to read video")
                     cap.release()
-                    st.rerun()()
-            else:
-                st.warning("No objects detected in the first frame. Try a different video or frame.")
+                    return
+                
+                # Resize the first frame to fit UI and store it
+                frame = resize_frame_to_fit(frame)
+                st.session_state.first_frame = frame
+                cap.release()
+            
+            # Show drawing interface with instructions
+            st.subheader("Select Object to Track")
+            st.write("Draw a bounding box around the object you want to track")
+            
+            # Create a placeholder for the drawing area
+            drawing_placeholder = st.empty()
+            
+            # Use streamlit-drawable-canvas for interactive drawing if available
+            if st.session_state.first_frame is not None:
+                try:
+                    if CANVAS_AVAILABLE:
+                        # Convert the frame to PIL Image
+                        pil_image = Image.fromarray(cv2.cvtColor(st.session_state.first_frame, cv2.COLOR_BGR2RGB))
+                        
+                        # Create a canvas for drawing
+                        canvas_result = st_canvas(
+                            fill_color="rgba(255, 165, 0, 0.3)",
+                            stroke_width=2,
+                            stroke_color="#FF0000",
+                            background_image=pil_image,
+                            drawing_mode="rect",
+                            key="canvas",
+                            height=st.session_state.first_frame.shape[0],
+                            width=st.session_state.first_frame.shape[1],
+                        )
+                        
+                        # Extract bounding box coordinates if drawn
+                        if canvas_result.json_data is not None and len(canvas_result.json_data["objects"]) > 0:
+                            # Get rectangle coordinates
+                            rect = canvas_result.json_data["objects"][0]
+                            x0, y0, width, height = rect["left"], rect["top"], rect["width"], rect["height"]
+                            
+                            # Convert to center coordinates and dimensions format used by YOLO
+                            center_x = x0 + width/2
+                            center_y = y0 + height/2
+                            
+                            # Store in session state
+                            st.session_state.user_roi = [center_x, center_y, width, height]
+                            st.success("Bounding box drawn! Click 'Start Tracking' in the sidebar to begin tracking.")
+                    else:
+                        # Fallback to manual selection
+                        drawing_placeholder.image(
+                            cv2.cvtColor(st.session_state.first_frame, cv2.COLOR_BGR2RGB),
+                            caption="Manual selection mode",
+                            use_column_width=True
+                        )
+                        
+                        st.write("Please enter bounding box coordinates manually:")
+                        x = st.number_input("X coordinate (top-left)", 0, st.session_state.first_frame.shape[1], 100)
+                        y = st.number_input("Y coordinate (top-left)", 0, st.session_state.first_frame.shape[0], 100)
+                        w = st.number_input("Width", 10, st.session_state.first_frame.shape[1], 100)
+                        h = st.number_input("Height", 10, st.session_state.first_frame.shape[0], 100)
+                        
+                        if st.button("Set Bounding Box"):
+                            # Convert to center coordinates and dimensions format used by YOLO
+                            center_x = x + w/2
+                            center_y = y + h/2
+                            st.session_state.user_roi = [center_x, center_y, w, h]
+                            
+                            # Draw the box on the frame to preview
+                            preview_frame = st.session_state.first_frame.copy()
+                            cv2.rectangle(
+                                preview_frame, 
+                                (int(x), int(y)), 
+                                (int(x + w), int(y + h)), 
+                                (0, 255, 0), 
+                                2
+                            )
+                            drawing_placeholder.image(
+                                cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB),
+                                caption="Selected object to track",
+                                use_column_width=True
+                            )
+                            
+                            st.success("Bounding box set! Click 'Start Tracking' in the sidebar to begin tracking.")
+                
+                except Exception as e:
+                    # Display the first frame for manual selection
+                    drawing_placeholder.image(
+                        cv2.cvtColor(st.session_state.first_frame, cv2.COLOR_BGR2RGB),
+                        caption="Manual selection mode",
+                        use_column_width=True
+                    )
+                    
+                    st.write("Please enter bounding box coordinates manually:")
+                    x = st.number_input("X coordinate (top-left)", 0, st.session_state.first_frame.shape[1], 100)
+                    y = st.number_input("Y coordinate (top-left)", 0, st.session_state.first_frame.shape[0], 100)
+                    w = st.number_input("Width", 10, st.session_state.first_frame.shape[1], 100)
+                    h = st.number_input("Height", 10, st.session_state.first_frame.shape[0], 100)
+                    
+                    if st.button("Set Bounding Box"):
+                        # Convert to center coordinates and dimensions format used by YOLO
+                        center_x = x + w/2
+                        center_y = y + h/2
+                        st.session_state.user_roi = [center_x, center_y, w, h]
+                        
+                        # Draw the box on the frame to preview
+                        preview_frame = st.session_state.first_frame.copy()
+                        cv2.rectangle(
+                            preview_frame, 
+                            (int(x), int(y)), 
+                            (int(x + w), int(y + h)), 
+                            (0, 255, 0), 
+                            2
+                        )
+                        drawing_placeholder.image(
+                            cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB),
+                            caption="Selected object to track",
+                            use_column_width=True
+                        )
+                        
+                        st.success("Bounding box set! Click 'Start Tracking' in the sidebar to begin tracking.")
+                
+                # Always show the manual option in an expander if the canvas is working
+                if CANVAS_AVAILABLE:
+                    with st.expander("Manual coordinate input (alternative)"):
+                        x = st.number_input("X coordinate (top-left)", 0, st.session_state.first_frame.shape[1], 100, key="manual_x")
+                        y = st.number_input("Y coordinate (top-left)", 0, st.session_state.first_frame.shape[0], 100, key="manual_y")
+                        w = st.number_input("Width", 10, st.session_state.first_frame.shape[1], 100, key="manual_w")
+                        h = st.number_input("Height", 10, st.session_state.first_frame.shape[0], 100, key="manual_h")
+                        
+                        if st.button("Set Bounding Box Manually", key="manual_set"):
+                            # Convert to center coordinates and dimensions format used by YOLO
+                            center_x = x + w/2
+                            center_y = y + h/2
+                            st.session_state.user_roi = [center_x, center_y, w, h]
+                            
+                            # Draw the box on the frame to preview
+                            preview_frame = st.session_state.first_frame.copy()
+                            cv2.rectangle(
+                                preview_frame, 
+                                (int(x), int(y)), 
+                                (int(x + w), int(y + h)), 
+                                (0, 255, 0), 
+                                2
+                            )
+                            drawing_placeholder.image(
+                                cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB),
+                                caption="Selected object to track",
+                                use_column_width=True
+                            )
+                            
+                            st.success("Bounding box set! Click 'Start Tracking' in the sidebar to begin tracking.")
             
         elif st.session_state.processing_phase == "track":
             # Setup tracking display
             video_placeholder = st.empty()
-            info_col1, info_col2 = st.columns(2)
-            
-            with info_col1:
-                direction_info = st.empty()
-            
-            with info_col2:
-                speed_info = st.empty()
             
             # Load the model
-            model = YOLO("models/exp1.pt")
+            model = YOLO("models/best.pt")
             
             # Open the video file
             cap = cv2.VideoCapture(st.session_state.video_path)
@@ -455,7 +663,7 @@ def app():
                 return
             
             # Get video info
-            fps = cap.get(cv2.CAP_PROP_FPS)
+            video_fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
             # Create a progress bar
@@ -469,13 +677,28 @@ def app():
                 # Resume from last position if applicable
                 cap.set(cv2.CAP_PROP_POS_FRAMES, st.session_state.frame_count)
             
+            # Variables for FPS calculation
+            frame_times = []
+            processing_times = []
+            fps_display = 0
+            latency_ms = 0
+            
             # Process video frames
             try:
+                prev_frame_time = time.time()
+                first_frame = True
+                
                 while cap.isOpened():
+                    # Measure frame start time for latency calculation
+                    frame_start_time = time.time()
+                    
                     # Read a frame
                     success, frame = cap.read()
                     if not success:
                         break
+                    
+                    # Resize frame to fit UI if needed
+                    frame = resize_frame_to_fit(frame)
                     
                     st.session_state.frame_count += 1
                     
@@ -484,8 +707,96 @@ def app():
                     progress_bar.progress(progress)
                     frame_text.text(f"Processing frame: {st.session_state.frame_count}/{total_frames}")
                     
-                    # Run YOLO tracking
-                    results = model.track(frame, persist=True)
+                    # Calculate actual FPS (not just the video's FPS)
+                    current_time = time.time()
+                    time_elapsed = current_time - prev_frame_time
+                    prev_frame_time = current_time
+                    
+                    # Add to the list of frame times (keep only last 30)
+                    frame_times.append(time_elapsed)
+                    if len(frame_times) > 30:
+                        frame_times.pop(0)
+                    
+                    # Calculate average FPS from recent frames
+                    if frame_times:
+                        avg_frame_time = sum(frame_times) / len(frame_times)
+                        fps_display = 1.0 / avg_frame_time if avg_frame_time > 0 else 0
+                        # Store in session state
+                        st.session_state.fps_value = fps_display
+                    
+                    # Run YOLO tracking with user-drawn ROI in the first frame
+                    if first_frame and st.session_state.user_roi is not None:
+                        try:
+                            # First attempt: using boxes parameter (for newer YOLO versions)
+                            results = model.track(
+                                frame, 
+                                persist=True, 
+                                boxes=np.array([st.session_state.user_roi]),
+                                classes=np.array([0])  # Assume class 0 (first class in model)
+                            )
+                            first_frame = False
+                            
+                            # Generate a tracking ID if none is present
+                            if results[0].boxes.id is None:
+                                st.session_state.selected_object_id = 1  # Assign ID 1 to the user-selected object
+                            else:
+                                st.session_state.selected_object_id = int(results[0].boxes.id[0])
+                                
+                        except Exception as e:
+                            st.warning(f"First tracking attempt failed: {str(e)}")
+                            try:
+                                # Second attempt: standard tracking then find object in ROI
+                                results = model.track(frame, persist=True)
+                                first_frame = False
+                                
+                                # If no IDs yet, run standard detection
+                                if results[0].boxes.id is None:
+                                    results = model(frame)
+                                
+                                # Find object closest to our ROI
+                                if len(results[0].boxes.xywh) > 0:
+                                    boxes = results[0].boxes.xywh.cpu().numpy()
+                                    roi_center_x, roi_center_y = st.session_state.user_roi[0], st.session_state.user_roi[1]
+                                    
+                                    # Calculate distance from each detected box to our ROI
+                                    min_dist = float('inf')
+                                    closest_idx = 0
+                                    
+                                    for i, box in enumerate(boxes):
+                                        box_x, box_y = box[0], box[1]
+                                        dist = ((box_x - roi_center_x)**2 + (box_y - roi_center_y)**2)**0.5
+                                        if dist < min_dist:
+                                            min_dist = dist
+                                            closest_idx = i
+                                    
+                                    # Use the closest object's ID
+                                    if results[0].boxes.id is not None:
+                                        st.session_state.selected_object_id = int(results[0].boxes.id[closest_idx])
+                                    else:
+                                        st.session_state.selected_object_id = 1
+                                else:
+                                    # No objects detected
+                                    st.session_state.selected_object_id = 1
+                            except Exception as e2:
+                                st.error(f"Backup tracking also failed: {str(e2)}")
+                                # Final fallback: just run standard tracking
+                                results = model.track(frame, persist=True)
+                                first_frame = False
+                                st.session_state.selected_object_id = 1
+                    else:
+                        # Continue tracking in subsequent frames
+                        results = model.track(frame, persist=True)
+                    
+                    # Calculate processing latency
+                    processing_time = (time.time() - frame_start_time) * 1000  # Convert to ms
+                    processing_times.append(processing_time)
+                    if len(processing_times) > 30:
+                        processing_times.pop(0)
+                    
+                    # Calculate average latency
+                    latency_ms = sum(processing_times) / len(processing_times) if processing_times else 0
+                    # Store in session state
+                    st.session_state.latency_value = latency_ms
                     
                     # Only continue if tracking IDs are available
                     if results[0].boxes.id is not None:
@@ -525,7 +836,7 @@ def app():
                                     
                                     # Calculate speed
                                     speed_kmh, px_per_frame = calculate_speed(
-                                        track_points, fps, st.session_state.pixels_per_meter)
+                                        track_points, video_fps, st.session_state.pixels_per_meter)
                                     
                                     # Apply calibration factor
                                     if speed_kmh is not None:
@@ -560,41 +871,61 @@ def app():
                                 direction_data,
                                 speed_data,
                                 st.session_state.frame_count,
-                                st.session_state.calibration_factor
+                                st.session_state.calibration_factor,
+                                fps_display,
+                                latency_ms
                             )
                             
                             # Display the frame
+                            annotated_frame = resize_frame_to_fit(annotated_frame)
                             video_placeholder.image(
                                 cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB),
-                                caption=f"Tracking Object ID: {st.session_state.selected_object_id}"
+                                caption=f"Tracking Object ID: {st.session_state.selected_object_id}",
+                                use_column_width=True
                             )
-                            
-                            # Update info displays
-                            if direction_data:
-                                direction_html = f"""
-                                <div style="padding: 10px; border-radius: 5px; background-color: #f0f0f0;">
-                                    <h4>Direction Analysis</h4>
-                                    <p>Horizontal: <b>{direction_data['horizontal']}</b></p>
-                                    <p>Vertical: <b>{direction_data['vertical']}</b></p>
-                                    <p>Depth: <b>{direction_data['depth']}</b></p>
-                                    <p>Angle: <b>{direction_data['angle']:.1f}°</b></p>
-                                </div>
-                                """
-                                direction_info.markdown(direction_html, unsafe_allow_html=True)
-                            
-                            if speed_data:
-                                speed_html = f"""
-                                <div style="padding: 10px; border-radius: 5px; background-color: #f0f0f0;">
-                                    <h4>Speed Analysis</h4>
-                                    <p>Speed: <b>{speed_data['kmh']:.1f} km/h</b></p>
-                                    <p>Movement: <b>{speed_data['px_per_frame']:.1f} px/frame</b></p>
-                                    <p>Calibration: <b>{st.session_state.calibration_factor:.2f}</b></p>
-                                </div>
-                                """
-                                speed_info.markdown(speed_html, unsafe_allow_html=True)
+                        else:
+                            # If the object is lost, show the frame with a message
+                            cv2.putText(
+                                frame, 
+                                "Object lost! Trying to re-detect...", 
+                                (50, 80), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 
+                                1, 
+                                (0, 0, 255), 
+                                2
+                            )
+                            frame = resize_frame_to_fit(frame)
+                            video_placeholder.image(
+                                cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                                caption="Object lost, attempting to re-detect",
+                                use_column_width=True
+                            )
+                    else:
+                        # If no tracking IDs are available, show the frame with a message
+                        cv2.putText(
+                            frame, 
+                            "No tracking IDs found!", 
+                            (50, 80), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 
+                            1, 
+                            (0, 0, 255), 
+                            2
+                        )
+                        frame = resize_frame_to_fit(frame)
+                        video_placeholder.image(
+                            cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                            caption="No tracking IDs found",
+                            use_column_width=True
+                        )
                     
-                    # Control playback speed
-                    time.sleep(1/fps)  # Play at original speed
+                    # Control playback speed - using a dynamic sleep to maintain video FPS
+                    processing_end_time = time.time()
+                    processing_duration = processing_end_time - frame_start_time
+                    target_duration = 1.0 / video_fps
+                    
+                    if processing_duration < target_duration:
+                        sleep_time = target_duration - processing_duration
+                        time.sleep(sleep_time)
                     
                     # Check for stop signal
                     if st.session_state.processing_phase != "track":
@@ -608,6 +939,35 @@ def app():
             
             finally:
                 cap.release()
+    
+    # Right column for tracking information
+    with main_col2:
+        if st.session_state.processing_phase == "track":
+            # Display tracking information in a more compact format
+            st.subheader("Tracking Information")
+            
+            # Direction information
+            direction_data = st.session_state.direction_history.get(st.session_state.selected_object_id)
+            if direction_data:
+                st.markdown("### Direction Analysis")
+                st.metric("Horizontal", direction_data['horizontal'])
+                st.metric("Vertical", direction_data['vertical'])
+                st.metric("Depth", direction_data['depth'])
+                st.metric("Angle", f"{direction_data['angle']:.1f}°")
+            
+            # Speed information
+            speed_data = st.session_state.speed_history.get(st.session_state.selected_object_id)
+            if speed_data:
+                st.markdown("### Speed Analysis")
+                st.metric("Speed", f"{speed_data['kmh']:.1f} km/h")
+                st.metric("Movement", f"{speed_data['px_per_frame']:.1f} px/frame")
+                st.metric("Calibration", f"{st.session_state.calibration_factor:.2f}")
+                st.metric("Frame", f"{st.session_state.frame_count}")
+            
+            # Performance metrics
+            st.markdown("### Performance Metrics")
+            st.metric("FPS", f"{st.session_state.fps_value:.1f}")
+            st.metric("Latency", f"{st.session_state.latency_value:.1f} ms")
 
 if __name__ == "__main__":
     app() 
